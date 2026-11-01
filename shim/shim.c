@@ -11,14 +11,8 @@
 #include "mmu.h"
 #include "loader.h"
 #include "ufs.h"
+#include "platform.h"
 
-#define IMEM_RESTART_REASON	0x146aa65cUL	/* qcom,msm-imem restart_reason@65c */
-#define RESTART_BOOTLOADER	0x77665500U
-#define PSHOLD			0x0c264000UL
-
-#define GICD_BASE		0x17a00000UL
-#define GICR_BASE		0x17a60000UL
-#define GICR_SIZE		0x100000UL
 #define GICR_PE_SIZE		0x20000UL
 #define GICR_TYPER		0x08
 #define GICR_WAKER		0x14
@@ -30,9 +24,6 @@
 #define GICR_ISPENDR0		(GICR_SGI + 0x200)
 #define GICR_ISACTIVER0		(GICR_SGI + 0x300)
 #define GICR_ICFGR1		(GICR_SGI + 0xc04)
-#define VTIMER_INTID		19	/* DT: <GIC_PPI 3 ...>, not the usual 27 */
-#define PTIMER_INTID		18	/* DT: <GIC_PPI 2 ...> */
-#define SGI_INTID		1
 
 #define PSCI_VERSION		0x84000000UL
 #define PSCI_CPU_SUSPEND	0xc4000001UL
@@ -45,25 +36,24 @@
 #define PSCI_SYSTEM_RESET2	0xc4000012UL
 #define SMCCC_VERSION		0x80000000UL
 
-#define NR_CPUS			8
-
 #define rsr(r) ({ uint64_t _v; __asm__ volatile("mrs %0, " r : "=r"(_v)); _v; })
 #define wsr(r, v) __asm__ volatile("msr " r ", %0" : : "r"((uint64_t)(v)))
 #define isb() __asm__ volatile("isb" ::: "memory")
 
 static inline uint32_t rd32(uintptr_t a) { return *(volatile uint32_t *)a; }
-static inline uint64_t rd64(uintptr_t a) { return *(volatile uint64_t *)a; }
+static inline __attribute__((unused)) uint64_t rd64(uintptr_t a) { return *(volatile uint64_t *)a; }
 static inline void wr32(uintptr_t a, uint32_t v) { *(volatile uint32_t *)a = v; }
-static inline void wr8(uintptr_t a, uint8_t v) { *(volatile uint8_t *)a = v; }
+static inline __attribute__((unused)) void wr8(uintptr_t a, uint8_t v) { *(volatile uint8_t *)a = v; }
 
 extern char secondary_entry[];
 
 static const char *stage;	/* set at runtime: no absolute pointers in data */
 static volatile uint64_t sec_mpidr[NR_CPUS];
-static volatile uint64_t sec_probe[4];	/* CPU1 redistributor write test */
+static volatile uint64_t __attribute__((unused)) sec_probe[4];	/* CPU1 redistributor write test */
 static volatile uint32_t irq_count, irq_other, irq_last;
 static volatile int irq_src;
 
+#if PLAT_GIC_V3
 /* ICC_SGI1R_EL1 value targeting the calling core only. */
 static uint64_t sgi_self(unsigned id)
 {
@@ -73,6 +63,7 @@ static uint64_t sgi_self(unsigned id)
 	       (uint64_t)id << 24 |
 	       (1U << (m & 0xf));		/* target list: Aff0 */
 }
+#endif
 
 static uint64_t smc(uint64_t fn, uint64_t a1, uint64_t a2, uint64_t a3)
 {
@@ -106,16 +97,44 @@ static void __attribute__((noreturn)) reset(unsigned after_s)
 	con_skip();
 	con_str("RESET", after_s > 20 ? "in 40s" : "in 20s");
 	delay_ms(after_s * 1000);
+#if PLAT_QCOM_RESTART
 	wr32(IMEM_RESTART_REASON, RESTART_BOOTLOADER);
 	__asm__ volatile("dsb sy" ::: "memory");
+#endif
 	smc(PSCI_SYSTEM_RESET, 0, 0, 0);
+#if PLAT_QCOM_RESTART
 	wr32(PSHOLD, 0);
+#endif
 	for (;;)
 		__asm__ volatile("wfe");
 }
 
 /* ---- exceptions ---- */
 
+#if !PLAT_GIC_V3
+/* GICv2 (GIC-400): memory-mapped CPU interface instead of ICC_* sysregs. */
+#define GICC_IAR	0x0c
+#define GICC_EOIR	0x10
+static void irq_handler(void)
+{
+	uint32_t iar = rd32(GICC_BASE + GICC_IAR);
+	uint32_t id = iar & 0x3ff;
+
+	if (id >= 1020)
+		return;	/* spurious */
+	irq_last = id;
+	if (id == (uint32_t)irq_src)
+		irq_count++;
+	else
+		irq_other++;
+	if (id == VTIMER_INTID)
+		wsr("cntv_tval_el0", rsr("cntfrq_el0") / 100);	/* 10 ms */
+	else if (id == PTIMER_INTID)
+		wsr("cntp_tval_el0", rsr("cntfrq_el0") / 100);
+	wr32(GICC_BASE + GICC_EOIR, iar);
+	isb();
+}
+#else
 static void irq_handler(void)
 {
 	uint64_t iar = rsr("icc_iar1_el1");
@@ -135,6 +154,7 @@ static void irq_handler(void)
 	wsr("icc_eoir1_el1", iar);
 	isb();
 }
+#endif
 
 void exc_handler(uint64_t slot, uint64_t *regs)
 {
@@ -163,11 +183,14 @@ void exc_handler(uint64_t slot, uint64_t *regs)
 
 /* ---- SMP ---- */
 
+#if PLAT_GIC_V3
 static uintptr_t find_gicr(void);
+#endif
 
 void secondary_main(uint64_t idx)
 {
 	sec_mpidr[idx] = rsr("mpidr_el1") | (1ULL << 63);
+#if PLAT_GIC_V3
 	if (idx == 1) {
 		uintptr_t r = find_gicr();
 		if (r) {
@@ -179,6 +202,7 @@ void secondary_main(uint64_t idx)
 		}
 		sec_probe[3] = r ? 1 : 0xdead;
 	}
+#endif
 	__asm__ volatile("dsb sy" ::: "memory");
 	smc(PSCI_CPU_OFF, 0, 0, 0);
 }
@@ -205,6 +229,7 @@ static void __attribute__((unused)) test_smp(void)
 
 /* ---- GIC + timer ---- */
 
+#if PLAT_GIC_V3
 static uintptr_t find_gicr(void)
 {
 	uint64_t aff = rsr("mpidr_el1");
@@ -339,6 +364,15 @@ static void test_gic(void)
 	wr32(r + GICR_ICENABLER0, 0xffffffff);
 	isb();
 }
+#else
+/* GICv2 bring-up probe: not written yet (docs/A21S.md, step 3). */
+static void test_gic(void)
+{
+	stage = "gic v2";
+	con_hex2("GICD", "ctlr=", rd32(GICD_BASE), "typer=", rd32(GICD_BASE + 4));
+	con_hex2("GICC", "ctlr=", rd32(GICC_BASE), "iidr=", rd32(GICC_BASE + 0xfc));
+}
+#endif
 
 /* ---- main ---- */
 
@@ -367,7 +401,7 @@ static uint64_t ticks_mem(void)
 
 static uint32_t to_us(uint64_t ticks)
 {
-	return ticks * 10 / 192;	/* 19.2 MHz */
+	return ticks * 1000 / (TIMEBASE_HZ / 1000);
 }
 
 void shim_main(uint64_t dtb)
@@ -385,10 +419,14 @@ void shim_main(uint64_t dtb)
 
 	/* No payload: probe the internal UFS while the MMU is still off. */
 	stage = "ufs";
+#if PLAT_HAS_UFS_PROBE
 	test_ufs();
 	con_skip();
 	/* Keep the probe results on screen (later tests clear it); reset after 3 min. */
 	con_str("UFS", "probe done, reset in ~3 min");
+#else
+	con_str(PLAT_NAME, "no payload; no storage probe on this platform, reset in ~3 min");
+#endif
 	delay_ms(180000);
 	reset(20);
 

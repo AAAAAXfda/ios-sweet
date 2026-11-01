@@ -1,5 +1,22 @@
 # iOS 16 on sweet (Redmi Note 10 Pro, SM7150) - working notes
 
+## A21s port (Samsung Galaxy A21s, Exynos 850) - 2026-11-01, branch `a21s-port`
+
+Read `docs/A21S.md` first. **Scaffold only; never booted. No phone was attached to this session.**
+- Done (observed): `shim/platform.h` splits per-device constants; `shim.c`/`build.sh` take `PLATFORM=a21s`
+  (needs `A21S_FB_BASE`, `A21S_BOOTIMG_ARGS`); GICv2 `irq_handler` in the shim. sweet output unchanged:
+  shim `.text` for shim/console/mmu/loader identical before/after under clang; `mkadt.py` sweet/highmem/qemu
+  trees byte-identical with a fixed seed. a21s shim compiles and links under clang; the real gcc `build.sh`
+  path and `mkbootimg` were NOT run (not installed here). The host_test console render was run for a21s.
+- `tools/mkadt.py --platform a21s` emits an Exynos 850 tree (8xA55, `arm,gic-400`, DWMMC node). Values are
+  from upstream Linux `exynos850.dtsi`, tagged [mainline]/[spec]/[UNVERIFIED] in the source.
+- `tools/a21s-collect.sh [-b]` dumps FDT/iomem/storage/fb/input facts and backs up boot-chain partitions
+  (output dir `a21s-dump/` is git-ignored).
+- Guesses, not facts: eMMC vs UFS on the A21s, framebuffer address and whether Samsung's bootloader leaves
+  the panel on, boot header version, SEANDROIDENFORCE trailer, 26 MHz timebase.
+- Next concrete action: owner runs `tools/a21s-collect.sh -b a21s-dump` on the phone; then fill the real
+  FB/RAM/storage values, then kernel GICv2 (docs/A21S.md step 3). No flash happens without the owner's OK.
+
 ## Agent handoff / active work (2026-10-15, latest)
 
 ### >>> UPDATE 2026-10-18 (read first, then the 10-17 handoff below) <<<

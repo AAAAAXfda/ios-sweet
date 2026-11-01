@@ -2,7 +2,10 @@
 """Build the minimal Apple Device Tree that the SWEET xnu needs to boot.
 
 Only what the early boot path actually reads (see NOTES.md); every MMIO
-address comes from the sweet live FDT. Usage:  mkadt.py OUT.adt [--dump] [--qemu] [--highmem]
+address comes from the sweet live FDT. Usage:
+  mkadt.py OUT.adt [--dump] [--qemu] [--highmem]
+  mkadt.py OUT.adt --platform a21s --mem-base 0x.. --mem-size 0x.. --fb-base 0x.. [--dump]
+The a21s tree (Samsung Galaxy A21s, Exynos 850) is a scaffold, see docs/A21S.md.
 """
 import hashlib, os, struct, sys
 
@@ -39,6 +42,27 @@ VTIMER_INTID = 19
 QEMU_GICD, QEMU_GICR, QEMU_TIMEBASE = 0x08000000, 0x080a0000, 62500000
 QEMU_VTIMER_INTID = 27
 
+# --- Samsung Galaxy A21s (SM-A217F, Exynos 850 / S5E3830) -----------------------
+# Tags: [mainline] upstream Linux exynos850.dtsi, [spec] published spec,
+# [UNVERIFIED] must be replaced by values from the phone's own FDT
+# (tools/a21s-collect.sh). The sweet values above are NOT valid here.
+A21S = dict(
+    compatible=('samsung,a21s', 'samsung,exynos850'),
+    # [mainline] 8x Cortex-A55; MPIDR Aff1:Aff0 = 0..3 (cluster0), 0x100..0x103 (cluster1)
+    mpidr=[0x0, 0x1, 0x2, 0x3, 0x100, 0x101, 0x102, 0x103],
+    cpu_compatible='arm,cortex-a55',
+    # [mainline] arm,gic-400 = GICv2: distributor + memory-mapped CPU interface, no redistributors
+    gic_compatible='arm,gic-400',
+    gicd=(0x12a01000, 0x1000), gicc=(0x12a02000, 0x2000),
+    timebase=26000000,   # [UNVERIFIED] oscclk is 26 MHz; read CNTFRQ_EL0 on the device
+    vtimer_intid=27,     # [mainline] PPI 11 (+16)
+    cpu_hz=2000000000,   # [spec] 8 x 2.0 GHz
+    # [mainline] DesignWare MMC host "mmc_0" = the eMMC socket on E850-96; whether the
+    # A21s's internal storage hangs off it (vs UFS) is [UNVERIFIED]
+    mmc=(0x12100000, 0x2000, 'samsung,exynos7-dw-mshc-smu'),
+    fb_size=(720, 1600),  # [spec]
+)
+
 BOOT_MANIFEST_HASH = hashlib.sha384(b'sweet boot manifest').digest()
 
 # The iOS userland is the iPhone X (iPhone10,3 / D22AP) IPSW. MobileGestalt
@@ -74,13 +98,26 @@ def node(name, props=(), children=()):
     return n
 
 
-def build(seed=None, qemu=False, highmem=False):
-    """qemu=True: same tree, but with QEMU virt's GIC addresses and CNTFRQ (tools/qemu-sweet.py)."""
-    phys_base, mem_size = (HIGH_PHYS_BASE, HIGH_MEM_SIZE) if highmem else (PHYS_BASE, MEM_SIZE)
+def build(seed=None, qemu=False, highmem=False, platform='sweet', mem_base=None, mem_size_=None, fb_base=None):
+    """qemu=True: same tree, but with QEMU virt's GIC addresses and CNTFRQ (tools/qemu-sweet.py).
+    platform='a21s': Exynos 850 tree; mem_base/mem_size_/fb_base are mandatory (no safe default)."""
+    a21s = platform == 'a21s'
+    if platform not in ('sweet', 'a21s'):
+        raise SystemExit(f'unknown platform {platform!r}')
+    if a21s:
+        if qemu or highmem:
+            raise SystemExit('--qemu/--highmem are sweet-only')
+        if None in (mem_base, mem_size_, fb_base):
+            raise SystemExit('a21s needs --mem-base, --mem-size and --fb-base (read them off the phone; docs/A21S.md)')
+        phys_base, mem_size = mem_base, mem_size_
+    else:
+        phys_base, mem_size = (HIGH_PHYS_BASE, HIGH_MEM_SIZE) if highmem else (PHYS_BASE, MEM_SIZE)
     # Carve the panic log off the top so the kernel never allocates over it.
     panic_base = phys_base + mem_size - PANIC_LOG_SIZE
     mem_size -= PANIC_LOG_SIZE
     gicd, gicr, timebase = (QEMU_GICD, QEMU_GICR, QEMU_TIMEBASE) if qemu else (GICD, GICR, TIMEBASE)
+    if a21s:
+        timebase = A21S['timebase']
     seed = seed if seed is not None else os.urandom(64)
     phandle = iter(range(1, 1000))
     ph = lambda: ('AAPL,phandle', u32(next(phandle)))
@@ -138,8 +175,8 @@ def build(seed=None, qemu=False, highmem=False):
         cpu_nodes.append(node(f'cpu{core}', [
             ph(),
             ('device_type', cstr('cpu')),
-            ('compatible', cstr('qcom,kryo470') + cstr('ARM,v8')),
-            ('reg', u32(core << 8)),  # actual MPIDR Aff1:Aff0, NOT logical ID
+            ('compatible', cstr(A21S['cpu_compatible'] if a21s else 'qcom,kryo470') + cstr('ARM,v8')),
+            ('reg', u32(A21S['mpidr'][core] if a21s else core << 8)),  # actual MPIDR Aff1:Aff0, NOT logical ID
             ('cpu-id', u32(core)),   # descriptive: XNU assigns IDs by DT order
             ('cluster-id', u32(0)),  # descriptive; see ml_parse_cpu_topology
             ('cluster-type', u32(0)),  # homogeneous CLUSTER_TYPE_SMP, not AMP
@@ -149,7 +186,7 @@ def build(seed=None, qemu=False, highmem=False):
             ('l3-cache-id', u32(0)),     # shared L3
             ('state', cstr('running' if core == 0 else 'stopped')),
             ('timebase-frequency', u32(timebase)),
-            ('clock-frequency', u32(2304000000 if core >= 6 else 1804800000)),
+            ('clock-frequency', u32(A21S['cpu_hz'] if a21s else (2304000000 if core >= 6 else 1804800000))),
             ('bus-frequency', u32(100000000)),
             ('memory-frequency', u32(1866000000)),
             ('peripheral-frequency', u32(timebase)),
@@ -158,13 +195,25 @@ def build(seed=None, qemu=False, highmem=False):
     cpus = node('cpus', [ph(), ('#address-cells', u32(1)),
                          ('#size-cells', u32(0))], cpu_nodes)
 
-    gic = node('gic', [
-        ph(),
-        ('compatible', cstr('arm,gic-v3')),
-        ('interrupt-controller', b''),
-        ('virtual-timer-intid', u32(QEMU_VTIMER_INTID if qemu else VTIMER_INTID)),
-        ('reg', u64(gicd - SOC_BASE, GICD_SIZE, gicr - SOC_BASE, GICR_SIZE)),
-    ])
+    if a21s:
+        # GICv2: reg = <GICD base,size  GICC base,size>. The kernel side (sweet_pexpert
+        # GICv3 sysreg code) has no GICv2 driver yet: see docs/A21S.md, step 3.
+        gic = node('gic', [
+            ph(),
+            ('compatible', cstr(A21S['gic_compatible'])),
+            ('interrupt-controller', b''),
+            ('virtual-timer-intid', u32(A21S['vtimer_intid'])),
+            ('reg', u64(A21S['gicd'][0] - SOC_BASE, A21S['gicd'][1],
+                        A21S['gicc'][0] - SOC_BASE, A21S['gicc'][1])),
+        ])
+    else:
+        gic = node('gic', [
+            ph(),
+            ('compatible', cstr('arm,gic-v3')),
+            ('interrupt-controller', b''),
+            ('virtual-timer-intid', u32(QEMU_VTIMER_INTID if qemu else VTIMER_INTID)),
+            ('reg', u64(gicd - SOC_BASE, GICD_SIZE, gicr - SOC_BASE, GICR_SIZE)),
+        ])
     arm_io = node('arm-io', [
         ph(),
         ('device_type', cstr('sweet-io')),
@@ -189,13 +238,24 @@ def build(seed=None, qemu=False, highmem=False):
             ('canvas-height', u32(2436)),
         ])])
 
-    fbcon = node('sweet-fbcon', [
-        ph(),
-        ('reg', u64(FB, FB_SIZE)),
-        ('width', u32(FB_W)),
-        ('height', u32(FB_H)),
-        ('stride', u32(FB_STRIDE)),
-    ])
+    if a21s:
+        w, h = A21S['fb_size']
+        # [UNVERIFIED] stride W*4, a8r8g8b8; size rounded up to 2 MiB blocks
+        fbcon = node('sweet-fbcon', [
+            ph(),
+            ('reg', u64(fb_base, (w * 4 * h + 0x1fffff) & ~0x1fffff)),
+            ('width', u32(w)),
+            ('height', u32(h)),
+            ('stride', u32(w * 4)),
+        ])
+    else:
+        fbcon = node('sweet-fbcon', [
+            ph(),
+            ('reg', u64(FB, FB_SIZE)),
+            ('width', u32(FB_W)),
+            ('height', u32(FB_H)),
+            ('stride', u32(FB_STRIDE)),
+        ])
 
     # bsd/dev/sweet_ufs.c: the UFS host ABL leaves running (absolute physical reg).
     ufs = node('sweet-ufs', [
@@ -203,6 +263,14 @@ def build(seed=None, qemu=False, highmem=False):
         ('compatible', cstr('qcom,ufshc')),
         ('reg', u64(UFS, UFS_SIZE)),
     ])
+
+    # A21s storage: the DesignWare MMC host (no kernel driver yet; stays absent from
+    # the tree until one exists, so XNU does not match a node it cannot drive).
+    mmc = node('sweet-mmc', [
+        ph(),
+        ('compatible', cstr(A21S['mmc'][2])),
+        ('reg', u64(A21S['mmc'][0], A21S['mmc'][1])),
+    ]) if a21s else None  # (ph() would renumber sweet's phandles)
 
     # pmap_compute_max_asids requires the node even when no overrides are set.
     # An absent pmap-max-asids property selects XNU's own MAX_ASIDS default.
@@ -231,18 +299,32 @@ def build(seed=None, qemu=False, highmem=False):
     # (iPhone10,3). 'xiaomi,sweet' stays for SweetPlatformExpert matching.
     return node('device-tree', [
         ph(),
-        ('compatible', cstr('D22AP') + cstr('iPhone10,3') + cstr('xiaomi,sweet') + cstr('qcom,sm7150') + cstr('AppleARM')),
+        ('compatible', cstr('D22AP') + cstr('iPhone10,3') + (
+            # 'xiaomi,sweet' is what SweetPlatformExpert matches today; the a21s keeps it
+            # until the platform expert learns a second board name.
+            cstr('xiaomi,sweet') + cstr(A21S['compatible'][0]) + cstr(A21S['compatible'][1]) if a21s else
+            cstr('xiaomi,sweet') + cstr('qcom,sm7150')) + cstr('AppleARM')),
         ('model', cstr('iPhone10,3')),
         ('target-type', cstr('D22')),
         ('target-sub-type', cstr('D22AP')),
         ('manufacturer', cstr('Apple Inc.')),
         ('#address-cells', u32(2)),
         ('#size-cells', u32(2)),
-    ], [chosen, defaults, cpus, arm_io, fbcon, buttons, pram] + product + ([] if qemu else [ufs]))
+    ], [chosen, defaults, cpus, arm_io, fbcon, buttons, pram] + product
+        + ([mmc] if a21s else [] if qemu else [ufs]))
+
+
+def _opt(name):
+    """Value of '--name VALUE' (int, 0x ok) or None."""
+    if name in sys.argv:
+        return int(sys.argv[sys.argv.index(name) + 1], 0)
+    return None
 
 
 if __name__ == '__main__':
-    root = build(qemu='--qemu' in sys.argv, highmem='--highmem' in sys.argv)
+    plat = sys.argv[sys.argv.index('--platform') + 1] if '--platform' in sys.argv else 'sweet'
+    root = build(qemu='--qemu' in sys.argv, highmem='--highmem' in sys.argv, platform=plat,
+                 mem_base=_opt('--mem-base'), mem_size_=_opt('--mem-size'), fb_base=_opt('--fb-base'))
     blob = adt.serialize(root)
     open(sys.argv[1], 'wb').write(blob)
     if '--dump' in sys.argv:

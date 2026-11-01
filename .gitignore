@@ -1,4 +1,5 @@
 # device dumps: persist/modemst/fsg hold IMEI + calibration; live DT holds the serial
+a21s-dump/
 backup/
 dtb/
 recovery/
